@@ -9,7 +9,8 @@ use nix::sys::timerfd::{TimerFd, ClockId, TimerFlags, TimerSetTimeFlags, Expirat
 use nix::sys::time::TimeSpec;
 use nix::unistd::Pid;
 
-use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
+use time::macros::format_description;
+use time::{OffsetDateTime, format_description::FormatItem};
 
 // --- 常量定义 ---
 const OOM_SCORE_THRESHOLD: i32 = 800;
@@ -201,31 +202,37 @@ fn perform_cleanup(whitelist: &HashSet<String>, log_path: &Option<String>) {
     }
 }
 
+static TIME_FMT: &[FormatItem<'static>] =
+    format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+
+fn now() -> String {
+    let dt = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    dt.format(TIME_FMT).unwrap_or_else(|_| "time_err".to_string())
+}
+
+
 /// 将清理记录写入日志文件
 fn write_log_to_file(path: &str, killed_list: &[String]) {
-    // 定义日期格式
-    let date_format = time::format_description::parse("[year]-[month]-[day]").unwrap();
-    let datetime_format = time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap();
+    // 获取当前日期和时间（本地时间优先）
+    let time_str = now();
 
-    // 获取当前日期和时间
-    let now = OffsetDateTime::now_utc();
-    let today = now.format(&date_format).unwrap();
-    let time_str = now.format(&datetime_format).unwrap();
+    // 只取日期部分用于判断是否需要清空（格式 YYYY-MM-DD）
+    let time_str = now();
+    let today = time_str.split_whitespace().next().unwrap_or("1970-01-01");
 
-    // 检查文件是否存在
+
+    // 检查文件是否存在并判断是否需要清空
     let need_clear = if let Ok(content) = fs::read_to_string(path) {
-        // 如果文件第一行包含的日期不是今天，就清空
-        !content.contains(&today)
+        !content.contains(today)
     } else {
         true
     };
 
-    // 打开文件，必要时清空
     let mut file = match OpenOptions::new()
         .create(true)
         .write(true)
-        .append(!need_clear) // 如果需要清空，就不用 append
-        .truncate(need_clear) // 清空文件
+        .append(!need_clear)
+        .truncate(need_clear)
         .open(path)
     {
         Ok(f) => f,
@@ -235,14 +242,10 @@ fn write_log_to_file(path: &str, killed_list: &[String]) {
         }
     };
 
-    // 写入头部
     let _ = writeln!(file, "=== 清理时间: {} ===", time_str);
-
-    // 写入被杀的进程名
     for pkg in killed_list {
         let _ = writeln!(file, "已清理: {}", pkg);
     }
-
     let _ = writeln!(file, "");
 }
 
