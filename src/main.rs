@@ -48,7 +48,7 @@ fn main() {
         
         // 【修复点】：这里使用 TimerSetTimeFlags
         timer.set(
-            Expiration::Interval(interval_spec)
+            Expiration::Interval(interval_spec),
             TimerSetTimeFlags::empty() 
         ).expect("Failed to set timer");
 
