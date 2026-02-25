@@ -13,7 +13,7 @@ use time::macros::format_description;
 use time::{OffsetDateTime, format_description::FormatItem};
 
 // --- 常量定义 ---
-const OOM_SCORE_THRESHOLD: i32 = 750;
+const OOM_SCORE_THRESHOLD: i32 = 800;
 const DEFAULT_INTERVAL: u64 = 60;
 
 // 配置结构体
