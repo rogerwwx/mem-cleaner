@@ -1,0 +1,37 @@
+name: Build Android Binary
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Cross (使用最新Git版以修复libunwind bug)
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build for Android (aarch64)
+        env:
+          CROSS_NO_WARNINGS: 0 # 核心：关闭新版 cross 烦人的警告报错机制
+        run: cross build --target aarch64-linux-android --release
+
+      - name: Rename Binary
+        run: |
+          mkdir -p output
+          cp target/aarch64-linux-android/release/mem_cleaner output/mem_cleaner
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mem_cleaner_arm64
+          path: output/mem_cleaner

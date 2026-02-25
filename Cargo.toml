@@ -1,0 +1,25 @@
+[package]
+name = "mem_cleaner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = { version = "0.27", features = ["fs", "process", "signal", "time"] }
+libc = "0.2"
+
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android-clang"
+rustflags = [
+    "-C", "link-arg=-static-libgcc",
+    "-C", "link-arg=-Wl,--gc-sections",
+    "-C", "link-arg=-Wl,--strip-all",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+debug = false
