@@ -12,7 +12,7 @@ use nix::unistd::Pid;
 use time::{OffsetDateTime, format_description};
 
 // --- 常量定义 ---
-const OOM_SCORE_THRESHOLD: i32 = 800;
+const OOM_SCORE_THRESHOLD: i32 = 750;
 const DEFAULT_INTERVAL: u64 = 60;
 
 // 配置结构体
@@ -48,6 +48,11 @@ fn main() {
     let config = load_config(config_path);
     println!("Interval: {}s", config.interval);
     println!("Whitelist loaded: {} entries", config.whitelist.len());
+
+    if let Some(ref path) = log_path {
+        let msg = vec!["进程压制已启动！".to_string()];
+        write_log_to_file(path, &msg);
+    }
 
     // 3. 初始化 TimerFD
     let timer = TimerFd::new(ClockId::CLOCK_BOOTTIME, TimerFlags::empty())
@@ -198,19 +203,29 @@ fn perform_cleanup(whitelist: &HashSet<String>, log_path: &Option<String>) {
 
 /// 将清理记录写入日志文件
 fn write_log_to_file(path: &str, killed_list: &[String]) {
-    // 定义格式描述
-    let format = format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
-        .expect("Invalid format description");
+    // 定义日期格式
+    let date_format = time::format_description::parse("[year]-[month]-[day]").unwrap();
+    let datetime_format = time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap();
 
-    // 获取本地时间，失败则退回 UTC
-    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    let time_str = now.format(&format).unwrap_or_else(|_| "Unknown Time".to_string());
+    // 获取当前日期和时间
+    let now = OffsetDateTime::now_utc();
+    let today = now.format(&date_format).unwrap();
+    let time_str = now.format(&datetime_format).unwrap();
 
-    // 以追加模式打开文件
+    // 检查文件是否存在
+    let need_clear = if let Ok(content) = fs::read_to_string(path) {
+        // 如果文件第一行包含的日期不是今天，就清空
+        !content.contains(&today)
+    } else {
+        true
+    };
+
+    // 打开文件，必要时清空
     let mut file = match OpenOptions::new()
         .create(true)
         .write(true)
-        .append(true)
+        .append(!need_clear) // 如果需要清空，就不用 append
+        .truncate(need_clear) // 清空文件
         .open(path)
     {
         Ok(f) => f,
@@ -228,10 +243,8 @@ fn write_log_to_file(path: &str, killed_list: &[String]) {
         let _ = writeln!(file, "已清理: {}", pkg);
     }
 
-    // 写入一个空行作为分隔
     let _ = writeln!(file, "");
 }
-
 
 // --- /proc 读取辅助函数 ---
 
