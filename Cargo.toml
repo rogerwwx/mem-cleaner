@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 nix = { version = "0.27", features = ["fs", "process", "signal", "time"] }
-time = { version = "0.3", default-features = false, features = ["std"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "local-offset"] }
 libc = "0.2"
 
 [target.aarch64-linux-android]
