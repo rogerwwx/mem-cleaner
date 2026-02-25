@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nix = { version = "0.27", features = ["fs", "process", "signal", "time"] }
+nix = { version = "0.28", default-features = false, features = ["time", "signal"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "macros", "std"] }
-libc = "0.2"
 
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android-clang"
