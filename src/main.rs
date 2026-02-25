@@ -216,10 +216,8 @@ fn write_log_to_file(path: &str, killed_list: &[String]) {
     // 获取当前日期和时间（本地时间优先）
     let time_str = now();
 
-    // 只取日期部分用于判断是否需要清空（格式 YYYY-MM-DD）
-    let time_str = now();
+    // 用 split_whitespace 拆分，取第一个部分作为日期
     let today = time_str.split_whitespace().next().unwrap_or("1970-01-01");
-
 
     // 检查文件是否存在并判断是否需要清空
     let need_clear = if let Ok(content) = fs::read_to_string(path) {
@@ -242,12 +240,17 @@ fn write_log_to_file(path: &str, killed_list: &[String]) {
         }
     };
 
+    // 写入头部
     let _ = writeln!(file, "=== 清理时间: {} ===", time_str);
+
+    // 写入被杀的进程名
     for pkg in killed_list {
         let _ = writeln!(file, "已清理: {}", pkg);
     }
+
     let _ = writeln!(file, "");
 }
+
 
 // --- /proc 读取辅助函数 ---
 
