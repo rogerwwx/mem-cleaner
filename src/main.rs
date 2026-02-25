@@ -51,9 +51,9 @@ fn main() {
     println!("Whitelist loaded: {} entries", config.whitelist.len());
 
     if let Some(ref path) = log_path {
-        let msg = vec!["进程压制已启动！".to_string()];
-        write_log_to_file(path, &msg);
+        write_startup_log(path);
     }
+    
 
     // 3. 初始化 TimerFD
     let timer = TimerFd::new(ClockId::CLOCK_BOOTTIME, TimerFlags::empty())
@@ -162,11 +162,11 @@ fn perform_cleanup(whitelist: &HashSet<String>, log_path: &Option<String>) {
         if uid < 10000 { continue; }
 
         // 2. OOM Score 过滤
-        let oom_score = match get_oom_score(pid) {
+        let oom_score_adj = match get_oom_score(pid) {
             Some(s) => s,
             None => continue, 
         };
-        if oom_score < OOM_SCORE_THRESHOLD {
+        if oom_score_adj < OOM_SCORE_THRESHOLD {
             continue;
         }
 
@@ -210,6 +210,34 @@ fn now() -> String {
     dt.format(TIME_FMT).unwrap_or_else(|_| "time_err".to_string())
 }
 
+fn write_startup_log(path: &str) {
+    let time_str = now();
+    let today = time_str.split_whitespace().next().unwrap_or("1970-01-01");
+
+    let need_clear = if let Ok(content) = fs::read_to_string(path) {
+        !content.contains(today)
+    } else {
+        true
+    };
+
+    let mut file = match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(!need_clear)
+        .truncate(need_clear)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to open log file: {}", e);
+            return;
+        }
+    };
+
+    let _ = writeln!(file, "=== 启动时间: {} ===", time_str);
+    let _ = writeln!(file, "进程压制已启动！");
+    let _ = writeln!(file, "");
+}
 
 /// 将清理记录写入日志文件
 fn write_log_to_file(path: &str, killed_list: &[String]) {
