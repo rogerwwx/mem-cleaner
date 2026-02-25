@@ -1,16 +1,17 @@
 use std::collections::HashSet;
 use std::env;
-use std::fs::{self, File};
-use std::io::Read; 
+use std::fs::{self, File, OpenOptions}; // 新增 OpenOptions
+use std::io::{Read, Write}; // 新增 Write
 use std::process::Command;
 
 use nix::sys::signal::{kill, Signal};
 use nix::sys::timerfd::{TimerFd, ClockId, TimerFlags, TimerSetTimeFlags, Expiration};
-use nix::sys::time::TimeSpec; // 去掉了 unused `TimeValLike`
+use nix::sys::time::TimeSpec;
 use nix::unistd::Pid;
 
+use time::{OffsetDateTime, format_description};
+
 // --- 常量定义 ---
-// OOM Score 800: 通常对应 CACHED_APP_MIN_ADJ
 const OOM_SCORE_THRESHOLD: i32 = 800;
 const DEFAULT_INTERVAL: u64 = 60;
 
@@ -21,16 +22,27 @@ struct AppConfig {
 }
 
 fn main() {
-    // 1. 获取命令行参数 (配置文件路径)
+    // 1. 获取命令行参数
+    // 用法: mem_cleaner <config_path> [log_path]
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <config_path>", args[0]);
+        eprintln!("Usage: {} <config_path> [log_path]", args[0]);
         std::process::exit(1);
     }
+    
     let config_path = &args[1];
+    // 获取日志路径 (Option)，如果 service.sh 传了就用，没传就不记
+    let log_path = if args.len() > 2 {
+        Some(args[2].clone())
+    } else {
+        None
+    };
 
     println!("Starting Daemon...");
     println!("Config Path: {}", config_path);
+    if let Some(ref p) = log_path {
+        println!("Log Path: {}", p);
+    }
 
     // 2. 加载配置
     let config = load_config(config_path);
@@ -38,32 +50,30 @@ fn main() {
     println!("Whitelist loaded: {} entries", config.whitelist.len());
 
     // 3. 初始化 TimerFD
-    // TimerFlags 用于创建 (如 CLOEXEC/NONBLOCK)
     let timer = TimerFd::new(ClockId::CLOCK_BOOTTIME, TimerFlags::empty())
         .expect("Failed to create timerfd");
 
     loop {
-        // --- 循环开始，设置下一次唤醒 ---
+        // --- 设置下一次唤醒 ---
         let interval_spec = TimeSpec::new(config.interval as i64, 0);
         
-        // 【修复点】：这里使用 TimerSetTimeFlags
         timer.set(
             Expiration::Interval(interval_spec),
             TimerSetTimeFlags::empty() 
         ).expect("Failed to set timer");
 
-        // --- 挂起进程 ---
+        // --- 挂起等待 ---
         let _ = timer.wait();
 
         // --- 唤醒后逻辑 ---
 
-        // A. 检测是否在 Doze (深度睡眠) 模式
+        // A. 检测 Doze
         if is_device_in_doze() {
             continue; 
         }
 
-        // B. 执行扫描清理
-        perform_cleanup(&config.whitelist);
+        // B. 执行扫描清理 (传入日志路径)
+        perform_cleanup(&config.whitelist, &log_path);
     }
 }
 
@@ -115,12 +125,15 @@ fn parse_packages(line: &str, whitelist: &mut HashSet<String>) {
     }
 }
 
-/// 核心清理逻辑 (严格模式：主程序不动，子程序除非白名单否则全杀)
-fn perform_cleanup(whitelist: &HashSet<String>) {
+/// 核心清理逻辑
+fn perform_cleanup(whitelist: &HashSet<String>, log_path: &Option<String>) {
     let proc_dir = match fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return,
     };
+
+    // 用于暂存本次循环被杀掉的进程名
+    let mut killed_list: Vec<String> = Vec::new();
 
     for entry in proc_dir {
         let entry = match entry {
@@ -128,7 +141,6 @@ fn perform_cleanup(whitelist: &HashSet<String>) {
             Err(_) => continue,
         };
 
-        // 1. 获取 PID
         let pid_str = entry.file_name();
         let pid_str = pid_str.to_string_lossy();
         let pid: i32 = match pid_str.parse() {
@@ -136,52 +148,90 @@ fn perform_cleanup(whitelist: &HashSet<String>) {
             Err(_) => continue,
         };
 
-        // 2. UID 过滤 (系统核心不动)
+        // 1. UID 过滤
         let uid = match get_uid(pid) {
             Some(u) => u,
             None => continue,
         };
         if uid < 10000 { continue; }
 
-        // 3. OOM Score 过滤 (必要程序不动)
-        // 只有 >= 800 (Cached/Empty) 的才会被视为“可杀目标”
+        // 2. OOM Score 过滤
         let oom_score = match get_oom_score(pid) {
             Some(s) => s,
             None => continue, 
         };
         if oom_score < OOM_SCORE_THRESHOLD {
-            continue; // 正在运行的服务、前台应用，不动
+            continue;
         }
 
-        // 4. 获取进程名
+        // 3. Cmdline 获取
         let cmdline = match get_cmdline(pid) {
             Some(c) => c,
             None => continue,
         };
 
-        // --- 核心逻辑修正 ---
-
-        // 5. 自动算法匹配主程序：主程序不动
-        // 判断依据：cmdline 中是否包含 ':'
-        // 如果不包含冒号，认为是主程序 (如 com.tencent.mm)，跳过不杀
+        // 4. 严格模式逻辑：只杀带冒号的子进程
         if !cmdline.contains(':') {
             continue; 
         }
 
-        // 6. 白名单例外：子程序被单独加进白名单
-        // 只有完全匹配白名单里的条目，才放过
-        // 例如：白名单里有 "com.tencent.mm:push"，则放过它
-        // 如果白名单里只有 "com.tencent.mm"，则照杀 "com.tencent.mm:push"
+        // 5. 白名单检查
         if whitelist.contains(&cmdline) {
             continue;
         }
 
-        // 7. 剩下的全是：后台(>800) + 子进程(有冒号) + 没在白名单
-        // 杀！
-        // println!("Killing sub-process: {} (OOM: {})", cmdline, oom_score);
-        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        // 6. 杀进程
+        // 尝试杀进程，如果成功（或发送信号成功），则记录
+        if kill(Pid::from_raw(pid), Signal::SIGKILL).is_ok() {
+            // 将被杀的进程名加入列表
+            killed_list.push(cmdline);
+        }
+    }
+
+    // 循环结束后，如果有进程被杀，且配置了日志路径，则写入文件
+    if !killed_list.is_empty() {
+        if let Some(path) = log_path {
+            write_log_to_file(path, &killed_list);
+        }
     }
 }
+
+/// 将清理记录写入日志文件
+fn write_log_to_file(path: &str, killed_list: &[String]) {
+    // 定义格式描述
+    let format = format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
+        .expect("Invalid format description");
+
+    // 获取本地时间，失败则退回 UTC
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let time_str = now.format(&format).unwrap_or_else(|_| "Unknown Time".to_string());
+
+    // 以追加模式打开文件
+    let mut file = match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to open log file: {}", e);
+            return;
+        }
+    };
+
+    // 写入头部
+    let _ = writeln!(file, "=== 清理时间: {} ===", time_str);
+
+    // 写入被杀的进程名
+    for pkg in killed_list {
+        let _ = writeln!(file, "已清理: {}", pkg);
+    }
+
+    // 写入一个空行作为分隔
+    let _ = writeln!(file, "");
+}
+
 
 // --- /proc 读取辅助函数 ---
 
