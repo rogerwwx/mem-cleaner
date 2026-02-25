@@ -9,7 +9,8 @@ use nix::sys::timerfd::{TimerFd, ClockId, TimerFlags, TimerSetTimeFlags, Expirat
 use nix::sys::time::TimeSpec;
 use nix::unistd::Pid;
 
-use time::{OffsetDateTime, format_description};
+use time::macros::format_description;
+use time::{OffsetDateTime, format_description::FormatItem};
 
 // --- 常量定义 ---
 const OOM_SCORE_THRESHOLD: i32 = 750;
