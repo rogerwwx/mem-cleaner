@@ -1,12 +1,10 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::Read; // 去掉了 unused `self`
-// use std::os::fd::AsRawFd; // 去掉了 unused import
+use std::io::Read; 
 use std::process::Command;
 
 use nix::sys::signal::{kill, Signal};
-// 引入 TimerSetTimeFlags
 use nix::sys::timerfd::{TimerFd, ClockId, TimerFlags, TimerSetTimeFlags, Expiration};
 use nix::sys::time::TimeSpec; // 去掉了 unused `TimeValLike`
 use nix::unistd::Pid;
@@ -50,7 +48,7 @@ fn main() {
         
         // 【修复点】：这里使用 TimerSetTimeFlags
         timer.set(
-            Expiration::OneShot(interval_spec),
+            Expiration::Interval(interval_spec)
             TimerSetTimeFlags::empty() 
         ).expect("Failed to set timer");
 
@@ -117,7 +115,7 @@ fn parse_packages(line: &str, whitelist: &mut HashSet<String>) {
     }
 }
 
-/// 核心清理逻辑
+/// 核心清理逻辑 (严格模式：主程序不动，子程序除非白名单否则全杀)
 fn perform_cleanup(whitelist: &HashSet<String>) {
     let proc_dir = match fs::read_dir("/proc") {
         Ok(d) => d,
@@ -130,6 +128,7 @@ fn perform_cleanup(whitelist: &HashSet<String>) {
             Err(_) => continue,
         };
 
+        // 1. 获取 PID
         let pid_str = entry.file_name();
         let pid_str = pid_str.to_string_lossy();
         let pid: i32 = match pid_str.parse() {
@@ -137,34 +136,49 @@ fn perform_cleanup(whitelist: &HashSet<String>) {
             Err(_) => continue,
         };
 
-        // 1. UID 过滤
+        // 2. UID 过滤 (系统核心不动)
         let uid = match get_uid(pid) {
             Some(u) => u,
             None => continue,
         };
         if uid < 10000 { continue; }
 
-        // 2. OOM Score 过滤
+        // 3. OOM Score 过滤 (必要程序不动)
+        // 只有 >= 800 (Cached/Empty) 的才会被视为“可杀目标”
         let oom_score = match get_oom_score(pid) {
             Some(s) => s,
             None => continue, 
         };
         if oom_score < OOM_SCORE_THRESHOLD {
-            continue;
+            continue; // 正在运行的服务、前台应用，不动
         }
 
-        // 3. 白名单匹配
+        // 4. 获取进程名
         let cmdline = match get_cmdline(pid) {
             Some(c) => c,
             None => continue,
         };
 
-        if whitelist.contains(&cmdline) { continue; }
+        // --- 核心逻辑修正 ---
 
-        let package_name = cmdline.split(':').next().unwrap_or(&cmdline);
-        if whitelist.contains(package_name) { continue; }
+        // 5. 自动算法匹配主程序：主程序不动
+        // 判断依据：cmdline 中是否包含 ':'
+        // 如果不包含冒号，认为是主程序 (如 com.tencent.mm)，跳过不杀
+        if !cmdline.contains(':') {
+            continue; 
+        }
 
-        // 4. 执行压制
+        // 6. 白名单例外：子程序被单独加进白名单
+        // 只有完全匹配白名单里的条目，才放过
+        // 例如：白名单里有 "com.tencent.mm:push"，则放过它
+        // 如果白名单里只有 "com.tencent.mm"，则照杀 "com.tencent.mm:push"
+        if whitelist.contains(&cmdline) {
+            continue;
+        }
+
+        // 7. 剩下的全是：后台(>800) + 子进程(有冒号) + 没在白名单
+        // 杀！
+        // println!("Killing sub-process: {} (OOM: {})", cmdline, oom_score);
         let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
     }
 }
