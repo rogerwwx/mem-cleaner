@@ -1,6 +1,6 @@
 [package]
 name = "mem_cleaner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -13,13 +13,17 @@ rustflags = [
     "-C", "link-arg=-static-libgcc",
     "-C", "link-arg=-Wl,--gc-sections",
     "-C", "link-arg=-Wl,--strip-all",
+    "-C", "link-arg=-Wl,--as-needed",
+    "-C", "link-arg=-Wl,--icf=all",
+    "-C", "link-arg=-Wl,--no-eh-frame-hdr",
 ]
 
 [profile.release]
 opt-level = "z"
-lto = true
-codegen-units = 1
+lto = "fat"        # 更激进的 LTO，可能比 true 更小
 panic = "abort"
 strip = "symbols"
+codegen-units = 1
 incremental = false
 debug = false
+rpath = false       # 禁止生成运行时搜索路径
