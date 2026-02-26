@@ -90,8 +90,14 @@ impl SubProcessCache {
         let current_pids = get_all_pids(); // 仅读取轻量级的纯数字目录
         let now = Self::now_ms();
 
-        // 1. 消失的 PID (利用差集极速运算)
-        for &old_pid in self.baseline_pids.difference(&current_pids) {
+        // 1. 消失的 PID (先收集到临时 Vec，避免借用冲突)
+        let disappeared: Vec<i32> = self
+            .baseline_pids
+            .difference(&current_pids)
+            .copied()
+            .collect();
+
+        for old_pid in disappeared {
             let hash_idx = Self::hash(old_pid);
             for node in &mut self.buckets[hash_idx] {
                 if node.pid == old_pid {
@@ -100,8 +106,13 @@ impl SubProcessCache {
             }
         }
 
-        // 2. 新增的 PID
-        for &new_pid in current_pids.difference(&self.baseline_pids) {
+        // 2. 新增的 PID (同样先收集)
+        let new_pids: Vec<i32> = current_pids
+            .difference(&self.baseline_pids)
+            .copied()
+            .collect();
+
+        for new_pid in new_pids {
             self.try_insert_new(new_pid, now, whitelist);
         }
 
@@ -403,7 +414,7 @@ fn write_startup_log(path: &str) {
         .open(path)
     {
         let _ = writeln!(file, "=== 启动时间: {} ===", time_str);
-        let _ = writeln!(file, "子进程压制已启动 (纯表1架构)！");
+        let _ = writeln!(file, "⚡进程压制已启动⚡)！");
         let _ = writeln!(file, "");
     }
 }
