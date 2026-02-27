@@ -8,7 +8,6 @@ use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFl
 use nix::unistd::Pid;
 
 use std::env;
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -258,10 +257,10 @@ fn perform_cleanup(
         res.path_buf.push('/');
         res.path_buf.push_str("oom_score_adj");
 
-        // 使用 openat(proc_fd, "12345/oom_score_adj")
+        // 使用 openat(Some(proc_fd), "12345/oom_score_adj")
         let score = {
             let p = Path::new(&res.path_buf);
-            match openat(proc_fd, p, OFlag::O_RDONLY, Mode::empty()) {
+            match openat(Some(proc_fd), p, OFlag::O_RDONLY, Mode::empty()) {
                 Ok(fd) => {
                     // 从 fd 读取内容
                     let mut f = unsafe { File::from_raw_fd(fd) };
@@ -288,10 +287,7 @@ fn perform_cleanup(
         // 优化 3: 查 UID (一次 syscall) - 通过 stat("/proc/<pid>")
         res.path_buf.clear();
         res.path_buf.push_str(pid_s);
-        let pid_path = Path::new(&res.path_buf);
-        // 使用 openat to get metadata via fs::metadata on "/proc/<pid>"
-        // fs::metadata accepts a Path, but we need absolute path; build "/proc/<pid>"
-        // 这里直接使用 std path for metadata to reuse existing API
+        // 使用 std metadata on "/proc/<pid>"
         let mut abs_pid_path = String::with_capacity(16);
         abs_pid_path.push_str("/proc/");
         abs_pid_path.push_str(pid_s);
@@ -312,7 +308,7 @@ fn perform_cleanup(
         res.path_buf.push_str("cmdline");
 
         let cmd_ok = match openat(
-            proc_fd,
+            Some(proc_fd),
             Path::new(&res.path_buf),
             OFlag::O_RDONLY,
             Mode::empty(),
