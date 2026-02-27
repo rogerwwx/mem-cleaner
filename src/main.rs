@@ -25,10 +25,16 @@ const DEFAULT_INTERVAL: u64 = 60;
 const DOZE_CACHE_TTL_SECS: u64 = 30; // Doze 状态缓存时间，避免频繁 fork
 
 // --- 结构体定义 ---
+/// 白名单匹配规则：支持完全匹配或前缀匹配
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum WhitelistRule {
+    Exact(String),  // 完全匹配
+    Prefix(String), // 前缀匹配（对应 xxx:* 格式）
+}
 
 struct AppConfig {
     interval: u64,
-    whitelist: FxHashSet<String>,
+    whitelist: FxHashSet<WhitelistRule>, // 替换为规则集合
 }
 
 /// 扫描资源复用池
@@ -212,9 +218,26 @@ fn main() {
     // 注意：程序正常退出时应 close(proc_fd)，但守护进程通常不会到达这里
 }
 
+/// 检查进程是否在白名单中（支持完全匹配和前缀匹配）
+fn is_in_whitelist(cmdline: &str, whitelist: &FxHashSet<WhitelistRule>) -> bool {
+    // 1. 先检查完全匹配
+    if whitelist.contains(&WhitelistRule::Exact(cmdline.to_string())) {
+        return true;
+    }
+    // 2. 再检查前缀匹配
+    for rule in whitelist {
+        if let WhitelistRule::Prefix(prefix) = rule {
+            if cmdline.starts_with(prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// perform_cleanup 使用预打开的 proc_fd，并用 openat 打开相对路径
 fn perform_cleanup(
-    whitelist: &FxHashSet<String>,
+    whitelist: &FxHashSet<WhitelistRule>,
     logger: &mut Option<Logger>,
     res: &mut ScannerResources,
     proc_fd: RawFd,
@@ -338,7 +361,8 @@ fn perform_cleanup(
             continue;
         }
 
-        if whitelist.contains(cmdline) {
+        // 核心修改：使用新的白名单匹配逻辑
+        if is_in_whitelist(cmdline, whitelist) {
             continue;
         }
 
@@ -373,11 +397,12 @@ fn is_device_in_deep_doze() -> bool {
 
 fn load_config(path: &str) -> AppConfig {
     let mut interval = DEFAULT_INTERVAL;
-    let mut whitelist: FxHashSet<String> = FxHashSet::default();
+    let mut whitelist: FxHashSet<WhitelistRule> = FxHashSet::default();
 
-    whitelist.insert("com.android.systemui".to_string());
-    whitelist.insert("android".to_string());
-    whitelist.insert("com.android.phone".to_string());
+    // 内置默认白名单（完全匹配）
+    whitelist.insert(WhitelistRule::Exact("com.android.systemui".to_string()));
+    whitelist.insert(WhitelistRule::Exact("android".to_string()));
+    whitelist.insert(WhitelistRule::Exact("com.android.phone".to_string()));
 
     if let Ok(content) = fs::read_to_string(path) {
         let mut in_whitelist_mode = false;
@@ -397,10 +422,10 @@ fn load_config(path: &str) -> AppConfig {
             } else if line.starts_with("whitelist:") {
                 in_whitelist_mode = true;
                 if let Some(val_part) = line.split(':').nth(1) {
-                    parse_packages(val_part, &mut whitelist);
+                    parse_whitelist_rules(val_part, &mut whitelist);
                 }
             } else if in_whitelist_mode {
-                parse_packages(line, &mut whitelist);
+                parse_whitelist_rules(line, &mut whitelist);
             }
         }
     }
@@ -411,11 +436,26 @@ fn load_config(path: &str) -> AppConfig {
     }
 }
 
-fn parse_packages(line: &str, whitelist: &mut FxHashSet<String>) {
+/// 解析白名单规则（支持 xxx:* 前缀匹配 和 xxx 完全匹配）
+fn parse_whitelist_rules(line: &str, whitelist: &mut FxHashSet<WhitelistRule>) {
     for part in line.split(',') {
         let pkg = part.trim();
-        if !pkg.is_empty() {
-            whitelist.insert(pkg.to_string());
+        if pkg.is_empty() {
+            continue;
+        }
+
+        // 处理通配符：如果以 :* 结尾，解析为前缀匹配
+        if let Some(prefix) = pkg.strip_suffix(":*") {
+            // 确保前缀包含 :（符合原代码的 cmdline 格式）
+            if prefix.contains(':') || !prefix.is_empty() {
+                whitelist.insert(WhitelistRule::Prefix(prefix.to_string()));
+            } else {
+                // 无效的前缀，按完全匹配处理
+                whitelist.insert(WhitelistRule::Exact(pkg.to_string()));
+            }
+        } else {
+            // 无通配符，按完全匹配处理
+            whitelist.insert(WhitelistRule::Exact(pkg.to_string()));
         }
     }
 }
