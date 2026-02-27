@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::os::unix::fs::MetadataExt; // 极速获取 UID
+use std::time::Instant;
 
 use nix::sys::signal::{kill, Signal};
 use nix::sys::time::TimeSpec;
@@ -13,12 +13,11 @@ use nix::unistd::Pid;
 use time::macros::format_description;
 use time::{format_description::FormatItem, OffsetDateTime};
 
-// --- 常量定义 ---
-const DEFAULT_OOM_SCORE_THRESHOLD: i32 = 800;
+// --- 配置区域 ---
+const DEFAULT_OOM_THRESHOLD: i32 = 800;
 const DEFAULT_INTERVAL: u64 = 60;
-const HASH_SIZE: usize = 128; // 扩大哈希桶以减少冲突
 const UPDATE_INTERVAL_MS: u64 = 500;
-const STABILITY_THRESHOLD: u8 = 6; // 观察阈值：20次 * 500ms = 10秒。10秒没变身才通过。
+const HASH_CAPACITY: usize = 64; // 初始容量64，不够自动扩容
 
 struct AppConfig {
     interval: u64,
@@ -26,200 +25,187 @@ struct AppConfig {
     oom_threshold: i32,
 }
 
-// ==========================================
-// 核心数据结构：模拟你描述的“默认表”节点
-// ==========================================
+#[derive(Clone, PartialEq, Debug)]
+enum ProcessType {
+    /// 猎物：名字带冒号的子进程 (e.g. "com.app:push")
+    /// 策略：只读 OOM，不读 Cmdline，超标即杀
+    TargetChild,
 
-#[derive(Clone, PartialEq)]
-enum NodeStatus {
-    Pending,   // 观察期：可能是主进程，也可能是还没改名的子进程
-    Monitored, // 已确认为目标子进程：持续监控 OOM
-    Ignored,   // 已确认为安全进程（系统进程或稳定主进程）：不再读取 cmdline
+    /// 疑似主进程：名字不带冒号 (e.g. "com.app")
+    /// 策略：每次必须重读 Cmdline，防止它变身
+    PotentialMain,
+
+    /// 忽略：系统进程或无关进程
+    Ignored,
 }
 
 #[derive(Clone)]
 struct ProcessNode {
     pid: i32,
     uid: u32,
-    process_name: String,
+    name: String,
     oom_score: i32,
-    status: NodeStatus,
-    retry_counter: u8, // 观察计数器
-    is_alive: bool,    // 存活标记，用于清理哈希表
+    p_type: ProcessType,
+    visited: bool, // 用于标记每一轮扫描是否存活
 }
 
-struct ProcessTable {
-    buckets: [Vec<ProcessNode>; HASH_SIZE],
+struct ProcessManager {
+    // 使用 HashMap 替代 Vec，查询 O(1)，自动扩容
+    table: HashMap<i32, ProcessNode>,
+    // IO 缓冲区复用，避免循环内频繁分配内存
+    cmd_buffer: Vec<u8>,
+    // 临时存储 OOM 读取结果
+    oom_buffer: [u8; 16],
 }
 
-impl ProcessTable {
+impl ProcessManager {
     fn new() -> Self {
         Self {
-            buckets: std::array::from_fn(|_| Vec::new()),
+            table: HashMap::with_capacity(HASH_CAPACITY),
+            cmd_buffer: Vec::with_capacity(256),
+            oom_buffer: [0u8; 16],
         }
     }
 
-    // 简单的取模哈希，对应步骤3中的哈希计算
-    fn hash(pid: i32) -> usize {
-        (pid as usize) % HASH_SIZE
-    }
-
-    fn check_alive(pid: i32) -> bool {
-        match kill(Pid::from_raw(pid), None) {
-            Ok(_) => true,
-            Err(nix::errno::Errno::ESRCH) => false,
-            Err(_) => std::path::Path::new(&format!("/proc/{}", pid)).exists(),
-        }
-    }
-
-    // 核心逻辑：对应步骤3、4、5的增量维护
+    /// 核心逻辑：全量扫描 + 动态身份修正
     fn update(&mut self, whitelist: &HashSet<String>) {
-        let current_pids = get_all_pids();
-
-        // 1. 标记死亡进程 (Bucket 清理)
-        for bucket in &mut self.buckets {
-            for node in bucket.iter_mut() {
-                if node.is_alive && !current_pids.contains(&node.pid) {
-                    node.is_alive = false;
-                }
-            }
-            // 物理移除死亡节点
-            bucket.retain(|node| node.is_alive);
+        // 1. 标记所有节点为未访问（准备清理死进程）
+        for node in self.table.values_mut() {
+            node.visited = false;
         }
 
-        // 2. 处理所有 PID (增量处理：表里有的更新，没的新增)
-        for pid in current_pids {
-            let hash_idx = Self::hash(pid);
-            let bucket = &mut self.buckets[hash_idx];
+        // 2. 遍历 /proc 目录
+        if let Ok(dir) = fs::read_dir("/proc") {
+            for entry in dir.flatten() {
+                // 极速解析 PID，跳过非数字目录
+                let pid = match entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<i32>().ok())
+                {
+                    Some(p) => p,
+                    None => continue,
+                };
 
-            // 尝试在桶中找到该 PID
-            if let Some(node) = bucket.iter_mut().find(|n| n.pid == pid) {
-                // --- 旧进程 (表里已有) ---
-                // 这里是关键修复：根据状态决定是否重新检查
-                match node.status {
-                    NodeStatus::Ignored => {
-                        // 系统进程或稳定主进程，直接跳过，极速！
-                        continue;
+                // 分情况处理：是旧人还是新人？
+                if let Some(node) = self.table.get_mut(&pid) {
+                    // --- 旧节点 (Update) ---
+                    node.visited = true;
+
+                    match node.p_type {
+                        ProcessType::Ignored => continue, // 极速跳过
+                        ProcessType::TargetChild => {
+                            // 已经是子进程了，不需要再看名字，只监控 OOM
+                            node.oom_score = self.read_oom_fast(pid).unwrap_or(node.oom_score);
+                        }
+                        ProcessType::PotentialMain => {
+                            // 【关键修复】疑似主进程，必须重读名字！
+                            // 也许上次它还没改名，现在可能变成 :push 了
+                            self.recheck_potential_main(node, whitelist);
+                        }
                     }
-                    NodeStatus::Monitored => {
-                        // 目标子进程，只更新 OOM，不读 Cmdline (省IO)
-                        node.oom_score = get_oom_score(pid).unwrap_or(node.oom_score);
+                } else {
+                    // --- 新节点 (Insert) ---
+                    // 只有这里需要分配一次内存创建节点
+                    if let Some(mut new_node) = self.create_node(pid, whitelist) {
+                        new_node.visited = true;
+                        self.table.insert(pid, new_node);
                     }
-                    NodeStatus::Pending => {
-                        // 【重点】观察期进程：必须重新读取 Cmdline 检查是否变身
-                        Self::recheck_pending_node(node, whitelist);
-                    }
-                }
-            } else {
-                // --- 新进程 (表里没有) ---
-                // 对应步骤4：新进程专属处理
-                if let Some(new_node) = Self::create_node(pid, whitelist) {
-                    bucket.push(new_node);
                 }
             }
         }
+
+        // 3. 物理清理死亡进程
+        self.table.retain(|_, node| node.visited);
     }
 
-    // 创建新节点（初次筛选）
-    fn create_node(pid: i32, whitelist: &HashSet<String>) -> Option<ProcessNode> {
-        let uid = get_uid(pid)?; // 读不到 UID 说明进程可能刚死，跳过
+    /// 创建新节点
+    fn create_node(&mut self, pid: i32, whitelist: &HashSet<String>) -> Option<ProcessNode> {
+        // 优化：直接从文件元数据拿 UID，不读 status 文件
+        let uid = get_uid_fast(pid)?;
 
-        // 1. 系统进程直接忽略
+        // 过滤系统进程 (UID < 10000)
         if uid < 10000 {
             return Some(ProcessNode {
                 pid,
                 uid,
-                process_name: String::new(),
+                name: String::new(),
                 oom_score: -1000,
-                status: NodeStatus::Ignored, // 永久忽略
-                retry_counter: 0,
-                is_alive: true,
+                p_type: ProcessType::Ignored,
+                visited: true,
             });
         }
 
-        // 2. 用户进程：读取 Cmdline
-        let cmdline = get_cmdline(pid).unwrap_or_default();
-        let oom = get_oom_score(pid).unwrap_or(0);
+        // 读取名字
+        let name = self.read_cmdline(pid).unwrap_or_default();
+        let oom = self.read_oom_fast(pid).unwrap_or(0);
 
-        // 3. 判定初始状态
-        let (status, name) = if cmdline.contains(':') {
-            // 一出生就带冒号（且不在白名单），直接监控
-            if whitelist.contains(&cmdline) {
-                (NodeStatus::Ignored, cmdline)
+        // 初始分类
+        let p_type = if name.contains(':') {
+            if whitelist.contains(&name) {
+                ProcessType::Ignored
             } else {
-                (NodeStatus::Monitored, cmdline)
+                ProcessType::TargetChild
             }
         } else {
-            // 没有冒号，可能是主进程，也可能是还没改名的子进程
-            // 标记为 Pending，后续持续观察
-            (NodeStatus::Pending, cmdline)
+            // 没冒号，暂时当做主进程，但后续每次 Update 都要查它
+            ProcessType::PotentialMain
         };
 
         Some(ProcessNode {
             pid,
             uid,
-            process_name: name,
+            name,
             oom_score: oom,
-            status,
-            retry_counter: 0,
-            is_alive: true,
+            p_type,
+            visited: true,
         })
     }
 
-    // 【核心修复逻辑】重新检查处于观察期的节点
-    fn recheck_pending_node(node: &mut ProcessNode, whitelist: &HashSet<String>) {
-        // 如果观察次数超过阈值（约10秒），认定为稳定主进程，不再检查
-        if node.retry_counter >= STABILITY_THRESHOLD {
-            node.status = NodeStatus::Ignored;
-            return;
-        }
-
-        // 重新读取名字
-        if let Some(new_cmdline) = get_cmdline(node.pid) {
-            if new_cmdline.contains(':') {
-                // ！！！抓到了！它变身了！！！
-                node.process_name = new_cmdline.clone();
-                if whitelist.contains(&new_cmdline) {
-                    node.status = NodeStatus::Ignored;
+    /// 【防止漏杀的核心】重新检查那些“看起来像主进程”的家伙
+    fn recheck_potential_main(&mut self, node: &mut ProcessNode, whitelist: &HashSet<String>) {
+        // 重新读取 cmdline
+        if let Some(new_name) = self.read_cmdline(node.pid) {
+            // 如果发现它名字里有冒号了！
+            if new_name.contains(':') {
+                node.name = new_name; // 更新名字
+                if whitelist.contains(&node.name) {
+                    node.p_type = ProcessType::Ignored;
                 } else {
-                    node.status = NodeStatus::Monitored;
-                    node.oom_score = get_oom_score(node.pid).unwrap_or(0);
+                    // 抓住你了！变身子进程，锁定为 TargetChild
+                    node.p_type = ProcessType::TargetChild;
+                    // 顺便更新一下 OOM
+                    node.oom_score = self.read_oom_fast(node.pid).unwrap_or(node.oom_score);
                 }
             } else {
-                // 还是没变身，增加计数器，继续观察
-                node.retry_counter += 1;
-                // 顺便更新一下 OOM，万一它是主进程但我们想看它数据
-                // node.oom_score = get_oom_score(node.pid).unwrap_or(node.oom_score);
+                // 还是没冒号，可能是真的主进程，也可能还没变身
+                // 继续保持 PotentialMain，下次还查
+                // 顺便更新 OOM (可选，如果你想监控主进程OOM的话)
+                node.oom_score = self.read_oom_fast(node.pid).unwrap_or(node.oom_score);
             }
-        } else {
-            // 读不到名字了？可能死了
-            node.is_alive = false;
         }
     }
 
-    // 查杀逻辑
-    fn query_and_kill(&mut self, threshold: i32, log_path: &Option<String>) {
+    /// 查杀逻辑：只杀 TargetChild
+    fn scan_and_kill(&mut self, threshold: i32, log_path: &Option<String>) {
         let mut killed_list = Vec::new();
 
-        for bucket in &mut self.buckets {
-            bucket.retain(|node| {
-                if !node.is_alive {
-                    return false;
-                }
+        // 收集要杀的 PID (避免在遍历时修改 HashMap 导致借用冲突)
+        // 这里我们只杀 TargetChild，绝对不碰 PotentialMain
+        let targets: Vec<(i32, String)> = self
+            .table
+            .values()
+            .filter(|n| n.p_type == ProcessType::TargetChild && n.oom_score >= threshold)
+            .map(|n| (n.pid, n.name.clone()))
+            .collect();
 
-                // 只杀 Monitored 状态的节点
-                if node.status == NodeStatus::Monitored && node.oom_score >= threshold {
-                    // 杀前做最后一次双重验证
-                    if Self::check_alive(node.pid) {
-                        // 尝试击杀
-                        if kill(Pid::from_raw(node.pid), Signal::SIGKILL).is_ok() {
-                            killed_list.push(node.process_name.clone());
-                            return false; // 移除节点
-                        }
-                    }
-                }
-                true
-            });
+        for (pid, name) in targets {
+            // 杀之前再确认一次存活，防止报错
+            if kill(Pid::from_raw(pid), Signal::SIGKILL).is_ok() {
+                killed_list.push(format!("{} (PID:{})", name, pid));
+                // 杀完立刻从表里移除，防止下次还读到
+                self.table.remove(&pid);
+            }
         }
 
         if !killed_list.is_empty() {
@@ -228,10 +214,42 @@ impl ProcessTable {
             }
         }
     }
+
+    // --- IO 辅助 ---
+
+    fn read_cmdline(&mut self, pid: i32) -> Option<String> {
+        let path = format!("/proc/{}/cmdline", pid);
+        self.cmd_buffer.clear();
+        if let Ok(mut f) = File::open(path) {
+            if f.read_to_end(&mut self.cmd_buffer).is_ok() {
+                // 取第一段，遇 \0 截断
+                let slice = self.cmd_buffer.split(|&c| c == 0).next()?;
+                return String::from_utf8(slice.to_vec()).ok();
+            }
+        }
+        None
+    }
+
+    fn read_oom_fast(&mut self, pid: i32) -> Option<i32> {
+        let path = format!("/proc/{}/oom_score_adj", pid);
+        if let Ok(mut f) = File::open(path) {
+            // 复用 buffer，不分配内存
+            if let Ok(n) = f.read(&mut self.oom_buffer) {
+                let s = std::str::from_utf8(&self.oom_buffer[..n]).ok()?.trim();
+                return s.parse().ok();
+            }
+        }
+        None
+    }
+}
+
+// 极速获取 UID (元数据法)
+fn get_uid_fast(pid: i32) -> Option<u32> {
+    fs::metadata(format!("/proc/{}", pid)).ok().map(|m| m.uid())
 }
 
 // ==========================================
-// 主入口
+// 主程序入口
 // ==========================================
 
 fn main() {
@@ -247,60 +265,47 @@ fn main() {
     } else {
         None
     };
-
     let config = load_config(config_path);
-    println!("Starting Daemon (Deep Logic Fixed)...");
-    println!("Kill Interval: {}s", config.interval);
-    println!("OOM Threshold: {}", config.oom_threshold);
+
+    println!("Starting Daemon (No-Pending / Strict Child Kill)...");
 
     if let Some(ref path) = log_path {
         write_startup_log(path);
     }
 
-    let timer = TimerFd::new(ClockId::CLOCK_BOOTTIME, TimerFlags::empty())
-        .expect("Failed to create timerfd");
-
-    // 500ms 唤醒一次进行数据更新
+    let timer = TimerFd::new(ClockId::CLOCK_BOOTTIME, TimerFlags::empty()).unwrap();
     let interval_spec = TimeSpec::new(0, (UPDATE_INTERVAL_MS * 1_000_000) as i64);
     timer
         .set(
             Expiration::Interval(interval_spec),
             TimerSetTimeFlags::empty(),
         )
-        .expect("Failed to set timer");
+        .unwrap();
 
-    let mut table = ProcessTable::new();
+    let mut manager = ProcessManager::new();
     let mut last_kill_time = Instant::now();
-    let mut initialized = false;
 
     loop {
         let _ = timer.wait();
 
-        // 1. 每 500ms 执行一次表更新（增量维护 + 观察期重检）
-        // 这一步非常快，因为 Ignored 节点直接跳过，只有 Pending 节点会读文件
-        table.update(&config.whitelist);
+        // 1. 高频更新：修正所有进程身份
+        manager.update(&config.whitelist);
 
-        if !initialized {
-            println!("Process Table Initialized. Monitoring...");
-            initialized = true;
-        }
-
-        // 2. 到达 Interval 周期才执行查杀
+        // 2. 周期查杀：只杀身份确定的子进程
         if last_kill_time.elapsed().as_secs() >= config.interval {
-            if !is_device_in_doze() {
-                // 只有非 Doze 模式才动刀
-                table.query_and_kill(config.oom_threshold, &log_path);
+            if !is_device_idle() {
+                manager.scan_and_kill(config.oom_threshold, &log_path);
             }
             last_kill_time = Instant::now();
         }
     }
 }
 
-// --- 辅助函数 (保持不变) ---
+// --- 辅助配置与日志 ---
 
 fn load_config(path: &str) -> AppConfig {
     let mut interval = DEFAULT_INTERVAL;
-    let mut oom_threshold = DEFAULT_OOM_SCORE_THRESHOLD;
+    let mut oom_threshold = DEFAULT_OOM_THRESHOLD;
     let mut whitelist = HashSet::new();
 
     if let Ok(content) = fs::read_to_string(path) {
@@ -310,7 +315,6 @@ fn load_config(path: &str) -> AppConfig {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-
             if line.starts_with("interval:") {
                 if let Some(val) = line.split(':').nth(1) {
                     if let Ok(v) = val.trim().parse() {
@@ -351,60 +355,8 @@ fn parse_packages(line: &str, whitelist: &mut HashSet<String>) {
     }
 }
 
-fn get_all_pids() -> HashSet<i32> {
-    let mut pids = HashSet::with_capacity(1024);
-    if let Ok(dir) = fs::read_dir("/proc") {
-        for entry in dir.flatten() {
-            if let Some(name_str) = entry.file_name().to_str() {
-                if let Ok(pid) = name_str.parse::<i32>() {
-                    pids.insert(pid);
-                }
-            }
-        }
-    }
-    pids
-}
-
-fn get_uid(pid: i32) -> Option<u32> {
-    let path = format!("/proc/{}/status", pid);
-    if let Ok(content) = fs::read_to_string(path) {
-        for line in content.lines() {
-            if line.starts_with("Uid:") {
-                return line.split_whitespace().nth(1)?.parse().ok();
-            }
-        }
-    }
-    None
-}
-
-fn get_oom_score(pid: i32) -> Option<i32> {
-    let path = format!("/proc/{}/oom_score_adj", pid);
-    let mut buf = String::with_capacity(8);
-    if File::open(path)
-        .and_then(|mut f| f.read_to_string(&mut buf))
-        .is_ok()
-    {
-        return buf.trim().parse().ok();
-    }
-    None
-}
-
-fn get_cmdline(pid: i32) -> Option<String> {
-    let path = format!("/proc/{}/cmdline", pid);
-    let mut buf = Vec::with_capacity(128);
-    if File::open(path)
-        .and_then(|mut f| f.read_to_end(&mut buf))
-        .is_ok()
-    {
-        return buf
-            .split(|&c| c == 0)
-            .next()
-            .and_then(|slice| String::from_utf8(slice.to_vec()).ok());
-    }
-    None
-}
-
-fn is_device_in_doze() -> bool {
+fn is_device_idle() -> bool {
+    // 检查 Doze 模式，避免打断深度睡眠
     if let Ok(output) = Command::new("cmd")
         .args(&["deviceidle", "get", "deep"])
         .output()
@@ -418,48 +370,32 @@ fn is_device_in_doze() -> bool {
 
 static TIME_FMT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-
 fn now() -> String {
-    let dt = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    dt.format(TIME_FMT)
-        .unwrap_or_else(|_| "time_err".to_string())
+    OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(TIME_FMT)
+        .unwrap_or_default()
 }
 
 fn write_startup_log(path: &str) {
-    let time_str = now();
-    let today = time_str.split_whitespace().next().unwrap_or("1970-01-01");
-    let need_clear = fs::read_to_string(path)
-        .map(|c| !c.contains(today))
-        .unwrap_or(true);
-    if let Ok(mut file) = OpenOptions::new()
+    let _ = OpenOptions::new()
         .create(true)
         .write(true)
-        .append(!need_clear)
-        .truncate(need_clear)
+        .append(true)
         .open(path)
-    {
-        let _ = writeln!(file, "=== 启动时间: {} ===", time_str);
-        let _ = writeln!(file, "⚡进程压制已启动(深度修复版)⚡");
-        let _ = writeln!(file, "");
-    }
+        .map(|mut f| writeln!(f, "\n=== 启动: {} ===", now()));
 }
 
-fn write_log_to_file(path: &str, killed_list: &[String]) {
-    let time_str = now();
-    let today = time_str.split_whitespace().next().unwrap_or("1970-01-01");
-    let need_clear = fs::read_to_string(path)
-        .map(|c| !c.contains(today))
-        .unwrap_or(true);
+fn write_log_to_file(path: &str, lines: &[String]) {
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .write(true)
-        .append(!need_clear)
-        .truncate(need_clear)
+        .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "=== 清理时间: {} ===", time_str);
-        for pkg in killed_list {
-            let _ = writeln!(file, "已清理: {}", pkg);
+        let _ = writeln!(file, "--- 清理时间: {} ---", now());
+        for line in lines {
+            let _ = writeln!(file, "已清理: {}", line);
         }
         let _ = writeln!(file, "");
     }
