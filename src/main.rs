@@ -358,33 +358,6 @@ fn perform_cleanup(
     }
 }
 
-// --- 底层 I/O 辅助 ---
-// 这些函数保留以兼容原有逻辑（部分路径现在使用 openat 直接读取）
-#[inline(always)]
-fn read_int_from_file(path: &str, buf: &mut Vec<u8>) -> Option<i32> {
-    buf.clear();
-    let mut f = File::open(path).ok()?;
-    let _ = f.read_to_end(buf).ok()?;
-    let s = std::str::from_utf8(buf).ok()?.trim();
-    s.parse().ok()
-}
-
-#[inline(always)]
-fn read_string_from_file(path: &str, buf: &mut Vec<u8>, out_str: &mut String) -> bool {
-    buf.clear();
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    if f.read_to_end(buf).is_err() {
-        return false;
-    }
-    let slice = buf.split(|&c| c == 0).next().unwrap_or(&[]);
-    out_str.clear();
-    out_str.push_str(&String::from_utf8_lossy(slice));
-    !out_str.is_empty()
-}
-
 fn is_device_in_deep_doze() -> bool {
     if let Ok(output) = Command::new("cmd")
         .args(&["deviceidle", "get", "deep"])
