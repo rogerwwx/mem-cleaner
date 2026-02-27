@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant; // 修复：删除未使用的 SystemTime 和 UNIX_EPOCH
 
 use nix::sys::signal::{kill, Signal};
 use nix::sys::time::TimeSpec;
@@ -141,7 +141,7 @@ impl ProcessTable {
         })
     }
 
-    // 原查杀逻辑，未修改
+    // 原查杀逻辑：修复 pid → node.pid 作用域问题
     fn query_and_kill(&mut self, threshold: i32, log_path: &Option<String>) {
         let mut killed_list = Vec::new();
 
@@ -153,7 +153,8 @@ impl ProcessTable {
 
                 if node.status == NodeStatus::Monitored && node.oom_score >= threshold {
                     if Self::check_alive(node.pid) {
-                        if kill(Pid::from_raw(pid), Signal::SIGKILL).is_ok() {
+                        // 修复：pid → node.pid
+                        if kill(Pid::from_raw(node.pid), Signal::SIGKILL).is_ok() {
                             killed_list.push(node.process_name.clone());
                             return false;
                         }
@@ -375,7 +376,7 @@ fn write_startup_log(path: &str) {
         .open(path)
     {
         let _ = writeln!(file, "=== 启动时间: {} ===", time_str);
-        let _ = writeln!(file, "⚡进程压制已启动⚡");
+        let _ = writeln!(file, "⚡进程压制已启动(无Pending状态版)⚡");
         let _ = writeln!(file, "");
     }
 }
