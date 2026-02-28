@@ -4,21 +4,10 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-nix = { version = "0.28", default-features = false, features = ["time", "signal", "fs", "fcntl"] }
+nix = { version = "0.28", default-features = false, features = ["time", "signal", "fs"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "macros", "std"] }
 fxhash = "0.2"
 itoa = "1.0"
-
-[target.aarch64-linux-android]
-linker = "aarch64-linux-android-clang"
-rustflags = [
-    "-C", "link-arg=-static-libgcc",
-    "-C", "link-arg=-Wl,--gc-sections",
-    "-C", "link-arg=-Wl,--strip-all",
-    "-C", "link-arg=-Wl,--as-needed",
-    "-C", "link-arg=-Wl,--icf=all",
-    "-C", "link-arg=-Wl,--no-eh-frame-hdr",
-]
 
 [profile.release]
 opt-level = "z"

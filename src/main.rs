@@ -273,7 +273,7 @@ fn perform_cleanup(
         // 过滤掉 30%~40% 的底层系统进程 (UID < 10000)
         // ==========================================
         let pid_path = Path::new(pid_s);
-        match fstatat(Some(proc_fd), pid_path, AtFlags::empty()) {
+        match fstatat(Some(proc_fd), pid_path, nix::fcntl::AtFlags::empty()) {
             Ok(stat) => {
                 if stat.st_uid < 10000 {
                     continue; // 核心系统进程，直接跳过
