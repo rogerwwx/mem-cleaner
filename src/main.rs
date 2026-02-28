@@ -2,7 +2,7 @@ use fxhash::FxHashSet;
 use itoa::Buffer as ItoaBuffer;
 use nix::fcntl::{open, openat, OFlag};
 use nix::sys::signal::{kill, Signal};
-use nix::sys::stat::{fstatat, FstatatFlags, Mode}; // 引入 fstatat 和 FstatatFlags
+use nix::sys::stat::{fstatat, Mode};
 use nix::sys::time::TimeSpec;
 use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
 use nix::unistd::Pid;
@@ -273,7 +273,7 @@ fn perform_cleanup(
         // 过滤掉 30%~40% 的底层系统进程 (UID < 10000)
         // ==========================================
         let pid_path = Path::new(pid_s);
-        match fstatat(Some(proc_fd), pid_path, FstatatFlags::empty()) {
+        match fstatat(Some(proc_fd), pid_path, AtFlags::empty()) {
             Ok(stat) => {
                 if stat.st_uid < 10000 {
                     continue; // 核心系统进程，直接跳过
