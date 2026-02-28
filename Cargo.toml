@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-nix = { version = "0.28", default-features = false, features = ["time", "signal", "fs"] }
+nix = { version = "0.28", default-features = false, features = ["time", "signal", "fs", "fcntl"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "local-offset", "macros", "std"] }
 fxhash = "0.2"
 itoa = "1.0"
