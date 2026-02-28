@@ -2,7 +2,7 @@ use fxhash::FxHashSet;
 use itoa::Buffer as ItoaBuffer;
 use nix::fcntl::{open, openat, OFlag};
 use nix::sys::signal::{kill, Signal};
-use nix::sys::stat::Mode;
+use nix::sys::stat::{fstatat, FstatatFlags, Mode}; // 引入 fstatat 和 FstatatFlags
 use nix::sys::time::TimeSpec;
 use nix::sys::timerfd::{ClockId, Expiration, TimerFd, TimerFlags, TimerSetTimeFlags};
 use nix::unistd::Pid;
@@ -10,7 +10,6 @@ use nix::unistd::Pid;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 use std::process::Command;
@@ -34,7 +33,7 @@ enum WhitelistRule {
 
 struct AppConfig {
     interval: u64,
-    whitelist: FxHashSet<WhitelistRule>, // 替换为规则集合
+    whitelist: FxHashSet<WhitelistRule>, // 规则集合
 }
 
 /// 扫描资源复用池
@@ -214,17 +213,13 @@ fn main() {
 
         perform_cleanup(&config.whitelist, &mut logger, &mut resources, proc_fd);
     }
-
-    // 注意：程序正常退出时应 close(proc_fd)，但守护进程通常不会到达这里
 }
 
 /// 检查进程是否在白名单中（支持完全匹配和前缀匹配）
 fn is_in_whitelist(cmdline: &str, whitelist: &FxHashSet<WhitelistRule>) -> bool {
-    // 1. 先检查完全匹配
     if whitelist.contains(&WhitelistRule::Exact(cmdline.to_string())) {
         return true;
     }
-    // 2. 再检查前缀匹配
     for rule in whitelist {
         if let WhitelistRule::Prefix(prefix) = rule {
             if cmdline.starts_with(prefix) {
@@ -235,7 +230,7 @@ fn is_in_whitelist(cmdline: &str, whitelist: &FxHashSet<WhitelistRule>) -> bool 
     false
 }
 
-/// perform_cleanup 使用预打开的 proc_fd，并用 openat 打开相对路径
+/// 核心清理逻辑：严格遵循“漏斗模型”进行极致性能过滤
 fn perform_cleanup(
     whitelist: &FxHashSet<WhitelistRule>,
     logger: &mut Option<Logger>,
@@ -259,11 +254,11 @@ fn perform_cleanup(
         let file_name = entry.file_name();
         let file_name_bytes = file_name.as_encoded_bytes();
 
+        // 只处理纯数字的 PID 目录
         if file_name_bytes.is_empty() || !file_name_bytes.iter().all(|b| b.is_ascii_digit()) {
             continue;
         }
 
-        // 直接把 pid bytes 转成 i32
         let pid_str = unsafe { std::str::from_utf8_unchecked(file_name_bytes) };
         let pid: i32 = match pid_str.parse() {
             Ok(p) => p,
@@ -273,62 +268,57 @@ fn perform_cleanup(
         // 使用 itoa 将 pid 转为字符串（零分配）
         let pid_s = itoa_buf.format(pid);
 
-        // 优化 2: 先查 oom_score_adj (最轻量的文件读取)
-        res.path_buf.clear();
-        // 构造相对路径 "12345/oom_score_adj"
-        res.path_buf.push_str(pid_s);
-        res.path_buf.push('/');
-        res.path_buf.push_str("oom_score_adj");
+        // ==========================================
+        // 漏斗第 1 层：查 UID (最轻量，仅 1 次 fstatat syscall)
+        // 过滤掉 30%~40% 的底层系统进程 (UID < 10000)
+        // ==========================================
+        let pid_path = Path::new(pid_s);
+        match fstatat(Some(proc_fd), pid_path, FstatatFlags::empty()) {
+            Ok(stat) => {
+                if stat.st_uid < 10000 {
+                    continue; // 核心系统进程，直接跳过
+                }
+            }
+            Err(_) => continue,
+        }
 
-        // 使用 openat(Some(proc_fd), "12345/oom_score_adj")
+        // ==========================================
+        // 漏斗第 2 层：查 oom_score_adj (较轻量，3 次 syscall + 简单解析)
+        // 过滤掉前台和活跃 App (score < 800)
+        // ==========================================
+        res.path_buf.clear();
+        res.path_buf.push_str(pid_s);
+        res.path_buf.push_str("/oom_score_adj");
+
         let score = {
-            let p = Path::new(&res.path_buf);
-            match openat(Some(proc_fd), p, OFlag::O_RDONLY, Mode::empty()) {
+            let p_oom = Path::new(&res.path_buf);
+            match openat(Some(proc_fd), p_oom, OFlag::O_RDONLY, Mode::empty()) {
                 Ok(fd) => {
-                    // 从 fd 读取内容
                     let mut f = unsafe { File::from_raw_fd(fd) };
                     res.file_buf.clear();
                     let _ = f.read_to_end(&mut res.file_buf);
-                    // File::from_raw_fd takes ownership; it will close on drop
-                    let s = std::str::from_utf8(&res.file_buf)
-                        .ok()
-                        .map(|s| s.trim().to_string());
+                    let s = std::str::from_utf8(&res.file_buf).ok().map(|s| s.trim());
                     s.and_then(|s| s.parse::<i32>().ok())
                 }
                 Err(_) => None,
             }
         };
 
-        if let Some(score) = score {
-            if score < OOM_SCORE_THRESHOLD {
-                continue;
+        if let Some(s) = score {
+            if s < OOM_SCORE_THRESHOLD {
+                continue; // 活跃进程，跳过
             }
         } else {
             continue;
         }
 
-        // 优化 3: 查 UID (一次 syscall) - 通过 stat("/proc/<pid>")
+        // ==========================================
+        // 漏斗第 3 层：查 cmdline 并匹配白名单 (最重，涉及字符串操作)
+        // 只有高危驻留后台 App 才会走到这一步
+        // ==========================================
         res.path_buf.clear();
         res.path_buf.push_str(pid_s);
-        // 使用 std metadata on "/proc/<pid>"
-        let mut abs_pid_path = String::with_capacity(16);
-        abs_pid_path.push_str("/proc/");
-        abs_pid_path.push_str(pid_s);
-
-        let metadata = match fs::metadata(&abs_pid_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        if metadata.uid() < 10000 {
-            continue;
-        }
-
-        // 优化 4: 查 cmdline
-        res.path_buf.clear();
-        res.path_buf.push_str(pid_s);
-        res.path_buf.push('/');
-        res.path_buf.push_str("cmdline");
+        res.path_buf.push_str("/cmdline");
 
         let cmd_ok = match openat(
             Some(proc_fd),
@@ -361,15 +351,17 @@ fn perform_cleanup(
             continue;
         }
 
-        // 核心修改：使用新的白名单匹配逻辑
+        // 白名单过滤
         if is_in_whitelist(cmdline, whitelist) {
             continue;
         }
 
+        // 仅杀带有 ':' 的进程 (通常是 App 的后台服务进程，如 com.xxx.app:push)
         if !cmdline.contains(':') {
             continue;
         }
 
+        // 击杀目标进程
         if kill(Pid::from_raw(pid), Signal::SIGKILL).is_ok() {
             killed_list.push(cmdline.clone());
         }
@@ -444,17 +436,13 @@ fn parse_whitelist_rules(line: &str, whitelist: &mut FxHashSet<WhitelistRule>) {
             continue;
         }
 
-        // 处理通配符：如果以 :* 结尾，解析为前缀匹配
         if let Some(prefix) = pkg.strip_suffix(":*") {
-            // 确保前缀包含 :（符合原代码的 cmdline 格式）
             if prefix.contains(':') || !prefix.is_empty() {
                 whitelist.insert(WhitelistRule::Prefix(prefix.to_string()));
             } else {
-                // 无效的前缀，按完全匹配处理
                 whitelist.insert(WhitelistRule::Exact(pkg.to_string()));
             }
         } else {
-            // 无通配符，按完全匹配处理
             whitelist.insert(WhitelistRule::Exact(pkg.to_string()));
         }
     }
